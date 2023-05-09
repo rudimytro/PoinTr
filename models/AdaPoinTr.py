@@ -8,6 +8,7 @@ import torch.nn as nn
 from functools import partial, reduce
 from timm.models.layers import DropPath, trunc_normal_
 from extensions.chamfer_dist import ChamferDistanceL1
+from extensions.emd.emd_module import emdModule
 from .build import MODELS, build_model_from_cfg
 from models.Transformer_utils import *
 from utils import misc
@@ -588,7 +589,6 @@ class DGCNN_Grouper(nn.Module):
                 num : list e.g.[1024, 512]
             ----------------------
             OUTPUT:
-
                 coor bs N 3
                 f    bs N C(128) 
         '''
@@ -621,6 +621,7 @@ class DGCNN_Grouper(nn.Module):
         f = f.transpose(-1, -2).contiguous()
 
         return coor, f
+    
 
 class Encoder(nn.Module):
     def __init__(self, encoder_channel):
@@ -768,7 +769,7 @@ class PCTransformer(nn.Module):
         assert self.encoder_type in ['graph', 'pn'], f'unexpected encoder_type {self.encoder_type}'
 
         in_chans = 3
-        self.num_query = query_num = config.num_query
+        self.num_query = config.num_query
         global_feature_dim = config.global_feature_dim
 
         print_log(f'Transformer with config {config}', logger='MODEL')
@@ -798,7 +799,7 @@ class PCTransformer(nn.Module):
         self.coarse_pred = nn.Sequential(
             nn.Linear(global_feature_dim, 1024),
             nn.GELU(),
-            nn.Linear(1024, 3 * query_num)
+            nn.Linear(1024, 128 * 3)
         )
         self.mlp_query = nn.Sequential(
             nn.Linear(global_feature_dim + 3, 1024),
@@ -847,46 +848,33 @@ class PCTransformer(nn.Module):
 
         coarse = self.coarse_pred(global_feature).reshape(bs, -1, 3)
 
-        coarse_inp = misc.fps(xyz, self.num_query//2) # B 128 3
-        coarse = torch.cat([coarse, coarse_inp], dim=1) # B 224+128 3?
-
-        mem = self.mem_link(x)
-
-        # query selection
-        query_ranking = self.query_ranking(coarse) # b n 1
-        idx = torch.argsort(query_ranking, dim=1, descending=True) # b n 1
-        coarse = torch.gather(coarse, 1, idx[:,:self.num_query].expand(-1, -1, coarse.size(-1)))
+        # coarse_inp = misc.fps(xyz, 256) # B 256 3
+        # coarse = torch.cat([coarse, coarse_inp], dim=1) # B 64+256 3
+        # mem = self.mem_link(x)
 
         if self.training:
-            # add denoise task
-            # first pick some point : 64?
-            picked_points = misc.fps(xyz, 64)
-            picked_points = misc.jitter_points(picked_points)
-            coarse = torch.cat([coarse, picked_points], dim=1) # B 256+64 3?
-            denoise_length = 64     
-
-            # produce query
-            q = self.mlp_query(
-            torch.cat([
-                global_feature.unsqueeze(1).expand(-1, coarse.size(1), -1),
-                coarse], dim = -1)) # b n c
+            # # produce query
+            # q = self.mlp_query(
+            # torch.cat([
+            #     global_feature.unsqueeze(1).expand(-1, coarse.size(1), -1),
+            #     coarse], dim = -1)) # b n c
 
             # forward decoder
-            q = self.decoder(q=q, v=mem, q_pos=coarse, v_pos=coor, denoise_length=denoise_length)
+            # q = self.decoder(q=q, v=mem, q_pos=coarse, v_pos=coor)
 
-            return q, coarse, denoise_length
+            return coarse
 
         else:
             # produce query
-            q = self.mlp_query(
-            torch.cat([
-                global_feature.unsqueeze(1).expand(-1, coarse.size(1), -1),
-                coarse], dim = -1)) # b n c
+            # q = self.mlp_query(
+            # torch.cat([
+            #     global_feature.unsqueeze(1).expand(-1, coarse.size(1), -1),
+            #     coarse], dim = -1)) # b n c
             
             # forward decoder
-            q = self.decoder(q=q, v=mem, q_pos=coarse, v_pos=coor)
+            # q = self.decoder(q=q, v=mem, q_pos=coarse, v_pos=coor)
 
-            return q, coarse, 0
+            return coarse
 
 ######################################## PoinTr ########################################  
 
@@ -910,7 +898,7 @@ class AdaPoinTr(nn.Module):
         else:
             if self.num_points is not None:
                 self.factor = self.num_points // self.num_query
-                assert self.num_points % self.num_query == 0
+                # assert self.num_points % self.num_query == 0
                 self.decode_head = SimpleRebuildFCLayer(self.trans_dim * 2, step=self.num_points // self.num_query)  # rebuild a cluster point
             else:
                 self.factor = self.fold_step**2
@@ -925,73 +913,30 @@ class AdaPoinTr(nn.Module):
         self.build_loss_func()
 
     def build_loss_func(self):
-        self.loss_func = ChamferDistanceL1()
+        self.loss_func = emdModule()
 
-    def get_loss(self, ret, gt, epoch=1):
-        pred_coarse, denoised_coarse, denoised_fine, pred_fine = ret
-        
-        assert pred_fine.size(1) == gt.size(1)
-
+    def get_loss(self, pred_coarse, gt, epoch=1):
         # denoise loss
-        idx = knn_point(self.factor, gt, denoised_coarse) # B n k 
-        denoised_target = index_points(gt, idx) # B n k 3 
-        denoised_target = denoised_target.reshape(gt.size(0), -1, 3)
-        assert denoised_target.size(1) == denoised_fine.size(1)
-        loss_denoised = self.loss_func(denoised_fine, denoised_target)
-        loss_denoised = loss_denoised * 0.5
+        # idx = knn_point(self.factor, gt, denoised_coarse) # B n k 
+        # denoised_target = index_points(gt, idx) # B n k 3 
+        # denoised_target = denoised_target.reshape(gt.size(0), -1, 3)
+        # assert denoised_target.size(1) == denoised_fine.size(1)
+        # loss_denoised = self.loss_func(denoised_fine, denoised_target)
+        # loss_denoised = loss_denoised * 0.5
+        loss_denoised = 0.0
 
         # recon loss
-        loss_coarse = self.loss_func(pred_coarse, gt)
-        loss_fine = self.loss_func(pred_fine, gt)
-        loss_recon = loss_coarse + loss_fine
+        loss_coarse = self.loss_func(pred_coarse, gt, 0.005, 50)
 
-        return loss_denoised, loss_recon
+        return loss_coarse[0].sum()
 
     def forward(self, xyz):
-        q, coarse_point_cloud, denoise_length = self.base_model(xyz) # B M C and B M 3
+        coarse_point_cloud = self.base_model(xyz) # B M C and B M 3
     
-        B, M ,C = q.shape
-
-        global_feature = self.increase_dim(q.transpose(1,2)).transpose(1,2) # B M 1024
-        global_feature = torch.max(global_feature, dim=1)[0] # B 1024
-
-        rebuild_feature = torch.cat([
-            global_feature.unsqueeze(-2).expand(-1, M, -1),
-            q,
-            coarse_point_cloud], dim=-1)  # B M 1027 + C
-
-        
-        # NOTE: foldingNet
-        if self.decoder_type == 'fold':
-            rebuild_feature = self.reduce_map(rebuild_feature.reshape(B*M, -1)) # BM C
-            relative_xyz = self.decode_head(rebuild_feature).reshape(B, M, 3, -1)    # B M 3 S
-            rebuild_points = (relative_xyz + coarse_point_cloud.unsqueeze(-1)).transpose(2,3)  # B M S 3
-
-        else:
-            rebuild_feature = self.reduce_map(rebuild_feature) # B M C
-            relative_xyz = self.decode_head(rebuild_feature)   # B M S 3
-            rebuild_points = (relative_xyz + coarse_point_cloud.unsqueeze(-2))  # B M S 3
-
         if self.training:
             # split the reconstruction and denoise task
-            pred_fine = rebuild_points[:, :-denoise_length].reshape(B, -1, 3).contiguous()
-            pred_coarse = coarse_point_cloud[:, :-denoise_length].contiguous()
-
-            denoised_fine = rebuild_points[:, -denoise_length:].reshape(B, -1, 3).contiguous()
-            denoised_coarse = coarse_point_cloud[:, -denoise_length:].contiguous()
-
-            assert pred_fine.size(1) == self.num_query * self.factor
-            assert pred_coarse.size(1) == self.num_query
-
-            ret = (pred_coarse, denoised_coarse, denoised_fine, pred_fine)
-            return ret
+            pred_coarse = coarse_point_cloud.contiguous()
+            return pred_coarse
 
         else:
-            assert denoise_length == 0
-            rebuild_points = rebuild_points.reshape(B, -1, 3).contiguous()  # B N 3
-
-            assert rebuild_points.size(1) == self.num_query * self.factor
-            assert coarse_point_cloud.size(1) == self.num_query
-
-            ret = (coarse_point_cloud, rebuild_points)
-            return ret
+            return coarse_point_cloud

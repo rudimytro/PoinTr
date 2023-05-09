@@ -1,6 +1,7 @@
 import torch.utils.data as data
 import numpy as np
 import os, sys
+from pathlib import Path
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(BASE_DIR)
 import data_transforms
@@ -33,19 +34,27 @@ class PCN(data.Dataset):
             if config.CARS:
                 self.dataset_categories = [dc for dc in self.dataset_categories if dc['taxonomy_id'] == '02958343']
 
-        self.n_renderings = 8 if self.subset == 'train' else 1
-        self.file_list = self._get_file_list(self.subset, self.n_renderings)
+        # self.n_renderings = 4 if self.subset == 'train' else 1
+        self.file_list = self._get_file_list(self.subset)
         self.transforms = self._get_transforms(self.subset)
 
     def _get_transforms(self, subset):
         if subset == 'train':
             return data_transforms.Compose([{
-                'callback': 'RandomSamplePoints',
+                'callback': 'UpSamplePoints ',
                 'parameters': {
                     'n_points': 2048
                 },
                 'objects': ['partial']
-            }, {
+            }, 
+            {
+                'callback': 'UpSamplePoints ',
+                'parameters': {
+                    'n_points': 128
+                },
+                'objects': ['gt']
+            }, 
+            {
                 'callback': 'RandomMirrorPoints',
                 'objects': ['partial', 'gt']
             },{
@@ -54,17 +63,25 @@ class PCN(data.Dataset):
             }])
         else:
             return data_transforms.Compose([{
-                'callback': 'RandomSamplePoints',
+                'callback': 'UpSamplePoints',
                 'parameters': {
                     'n_points': 2048
                 },
                 'objects': ['partial']
-            }, {
+            }, 
+            {
+                'callback': 'UpSamplePoints ',
+                'parameters': {
+                    'n_points': 128
+                },
+                'objects': ['gt']
+            }, 
+            {
                 'callback': 'ToTensor',
                 'objects': ['partial', 'gt']
             }])
 
-    def _get_file_list(self, subset, n_renderings=1):
+    def _get_file_list(self, subset):
         """Prepare file list for the dataset"""
         file_list = []
 
@@ -78,29 +95,27 @@ class PCN(data.Dataset):
                     dc['taxonomy_id'],
                     'model_id':
                     s,
-                    'partial_path': [
-                        self.partial_points_path % (subset, dc['taxonomy_id'], s, i)
-                        for i in range(n_renderings)
-                    ],
-                    'gt_path':
-                    self.complete_points_path % (subset, dc['taxonomy_id'], s),
+                    'partial_path': 
+                        [p.as_posix() for p in Path(self.partial_points_path % (subset, dc['taxonomy_id'], s)).iterdir()],
+                    'gt_path': 
+                        [p.as_posix() for p in Path(self.complete_points_path % (subset, dc['taxonomy_id'], s)).iterdir()]
                 })
 
         print_log('Complete collecting files of the dataset. Total files: %d' % len(file_list), logger='PCNDATASET')
         return file_list
 
     def __getitem__(self, idx):
+        idx = idx % len(self.file_list)
         sample = self.file_list[idx]
         data = {}
-        rand_idx = random.randint(0, self.n_renderings - 1) if self.subset=='train' else 0
+        rand_idx = random.randint(0, len(sample['partial_path']) - 1)
 
         for ri in ['partial', 'gt']:
             file_path = sample['%s_path' % ri]
-            if type(file_path) == list:
-                file_path = file_path[rand_idx]
+            file_path = file_path[rand_idx]
             data[ri] = IO.get(file_path).astype(np.float32)
 
-        assert data['gt'].shape[0] == self.npoints
+        # assert data['gt'].shape[0] == self.npoints
 
         if self.transforms is not None:
             data = self.transforms(data)
@@ -108,7 +123,8 @@ class PCN(data.Dataset):
         return sample['taxonomy_id'], sample['model_id'], (data['partial'], data['gt'])
 
     def __len__(self):
-        return len(self.file_list)
+        return len(self.file_list) * 80
+
 
 @DATASETS.register_module()
 class PCNv2(data.Dataset):
